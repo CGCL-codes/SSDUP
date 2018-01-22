@@ -9,6 +9,7 @@
 #include <sys/types.h>
 #include <sys/syscall.h>
 #include <sys/stat.h>
+#include <string.h>
 #include <fcntl.h>
 #include <stdlib.h>
 #ifdef HAVE_MALLOC_H
@@ -36,6 +37,8 @@
 #include "../../../server/pvfs2-server.h"
 #include <dirent.h>
 #include <time.h>  
+#include <sys/time.h>
+#include <math.h>
 static long avl_cost = 0;
 static long group_cost = 0;
 static long array_cost = 0;
@@ -46,9 +49,19 @@ typedef int bool;
 typedef struct ssd_cache_fd
 {
     int fd;
-	int is_open;
+    int ori_fd;
+    int is_open;
+    int write_back_fd;
+    char cache[10];
+    struct ssd_cache_fd * next;
 } ssd_cache_fd;
-
+typedef struct write_back_use
+{
+    int fd;
+    int ssd_fd;
+    struct write_back_use *next;
+    char cache[10];
+} write_back_use;
 extern gen_mutex_t dbpf_attr_cache_mutex;
 
 #define AIOCB_ARRAY_SZ 64
@@ -74,8 +87,12 @@ int is_write_hhd = 1;
 float percent=0;
 int is_ssd = 0;
 int is_hhd = 0;
+int total_is_ssd = 0;
+int total_is_hhd = 0;
 int ret_array[1024];
 off_t avl_offset_array[204800];
+off_t avl_offset_array_ssd[204800];
+char avl_cachename[204800][10];
 TROVE_size avl_size_array[204800];
 int avl_index = 0;
 int merge = 0;
@@ -83,6 +100,25 @@ TROVE_size wb_total=0;
 TROVE_size avl_total_size=0;
 
 static int _offset_count = 0;
+
+int per_list_len = 0;
+float per,temp_per,level=0.5;
+float percent_list[100000];
+int mod_flag=0;
+long long int ssdsizesum=0;
+int is_hdd=0;
+static int in_dead_lock=0;
+pthread_mutex_t noderlock_mutex;
+int init_mutexlock=0;
+struct timeval avl_start, avl_end;
+struct timeval group_start, group_end;
+struct timeval open_start, open_end;
+struct timeval write_start, write_end;
+unsigned long avl_diff=0, group_diff=0, open_diff=0, write_diff=0;
+float rate,total_rate;
+float percsum=0.0,percavg;
+int clearflag=0;
+float clearcount=0.0,clearperlistcount=0.0;
 /********************************/
 static dbpf_op_queue_p s_dbpf_io_ready_queue = NULL;
 static gen_mutex_t s_dbpf_io_mutex = GEN_MUTEX_INITIALIZER;
@@ -111,7 +147,7 @@ static gen_mutex_t  dbpf_rdwr_lock = GEN_MUTEX_INITIALIZER;
 
 static bool full_flag1 = false;
 static bool full_flag2 = false;
-
+static bool cr_mod = false;
 static gen_mutex_t dbpf_update_offset_map_lock = GEN_MUTEX_INITIALIZER;
 
 static struct mavlnode *nodew= NULL;
@@ -120,7 +156,8 @@ volatile int noderlock = 0;
 static int is_reading= 0;
 
 
-static ssd_cache_fd *ssd_fd =NULL; 
+static ssd_cache_fd *ssd_fd =NULL, *link_ssd_fd = NULL, *link_ssd_fd_1 = NULL, *link_ssd_fd_2 = NULL; 
+//static int write_count = 0;
 static void mylog(char *message);
 static int write_back(void *fd);
 static void in_order_travel_test(struct mavlnode *n);
@@ -165,9 +202,11 @@ void quick_sort(int arra[], int arrb[], int arrc[],int start, int end){
 }
 
 static int open_fd_ssd(
-    ssd_cache_fd** ssd_fd , TROVE_offset *filesize,
+    ssd_cache_fd** ssd_fd ,ssd_cache_fd** link_ssd_fd,  TROVE_offset *filesize,
     enum open_cache_open_type,
-    TROVE_handle handle);
+    TROVE_handle handle,
+    struct aiocb **aiocb_ptr_array,
+    int write_back_fd);
 
 static size_t direct_aligned_write_ssd(int fd, 
                                     void *buf,
@@ -212,18 +251,23 @@ extern gen_mutex_t dbpf_completion_queue_array_mutex[TROVE_MAX_CONTEXTS];
 
 
 static int open_fd_ssd(
-    ssd_cache_fd **ssd_fd, TROVE_offset *file_size,
+    ssd_cache_fd **ssd_fd, ssd_cache_fd** link_ssd_fd, TROVE_offset *file_size,
     enum open_cache_open_type type,
-    TROVE_handle handle)
+    TROVE_handle handle,
+    struct aiocb **aiocb_ptr_array,
+    int write_back_fd)
 {
+    ssd_cache_fd * start_ssd_fd, *end_ssd_fd, *insert_ssd_fd;
     int flags = 0;
     int mode = 0;
     char filename[PATH_MAX] = {0};
-	struct stat statbuf;
-
-	if(strlen(to_buffer_region)==0)snprintf(to_buffer_region,PATH_MAX,my_wb_info.buff_path_1);
-	snprintf(filename,PATH_MAX,to_buffer_region);
-	strcat(filename,"/cache");
+    struct stat statbuf;
+    char realname[20],cache[20]="/cache-";
+    sprintf(realname,"%d",aiocb_ptr_array[0]->aio_fildes); 
+    strcat(cache,realname);
+    if(strlen(to_buffer_region)==0)snprintf(to_buffer_region,PATH_MAX,my_wb_info.buff_path_1);
+    snprintf(filename,PATH_MAX,to_buffer_region);
+    strcat(filename,cache);
 
     flags = O_RDWR;
 
@@ -233,19 +277,51 @@ static int open_fd_ssd(
         flags |= O_CREAT;
         mode = TROVE_FD_MODE;
     }
-
-	if(*ssd_fd==NULL)
-	{
-	    *ssd_fd = (ssd_cache_fd *)malloc(sizeof(ssd_cache_fd));
-		(*ssd_fd)->fd = -1;
-		(*ssd_fd)->is_open = 0;
+    if(*link_ssd_fd==NULL)
+    {
+        *link_ssd_fd = (ssd_cache_fd *)malloc(sizeof(ssd_cache_fd));
+        *ssd_fd = (ssd_cache_fd *)malloc(sizeof(ssd_cache_fd));
+        if((*link_ssd_fd) == NULL){ gossip_err("link_ssd_fd is not created!\n");}
+        (*link_ssd_fd)->ori_fd = -1;
+        (*link_ssd_fd)->fd = -1;
+        (*link_ssd_fd)->is_open = 0;
+        (*link_ssd_fd)->write_back_fd= -1;
+        (*link_ssd_fd)->next = NULL;
+        
     }
-	if((*ssd_fd) == NULL){ gossip_err("ssd_fd is not created!\n");}
-	if((*ssd_fd)->is_open !=1)
-	{
-         (*ssd_fd)->fd = DBPF_OPEN(filename, flags, mode);
-		 (*ssd_fd)->is_open = 1;
-	}
+    for(start_ssd_fd=*link_ssd_fd;start_ssd_fd!=NULL;start_ssd_fd=start_ssd_fd->next)
+    {
+        if(aiocb_ptr_array[0]->aio_fildes == start_ssd_fd->ori_fd)
+        {
+            (*ssd_fd)->fd = start_ssd_fd->fd;
+            (*ssd_fd)->ori_fd = start_ssd_fd->ori_fd;
+            (*ssd_fd)->is_open = start_ssd_fd->is_open;
+            (*ssd_fd)->write_back_fd= start_ssd_fd->write_back_fd;
+	    strcpy((*ssd_fd)->cache,start_ssd_fd->cache);
+            (*ssd_fd)->next = NULL;
+            break;
+        }
+        if(start_ssd_fd->next==NULL)
+            end_ssd_fd = start_ssd_fd;
+    }
+    if(start_ssd_fd==NULL)
+    {
+        insert_ssd_fd = (ssd_cache_fd *)malloc(sizeof(ssd_cache_fd));
+        insert_ssd_fd->fd = DBPF_OPEN(filename, flags, mode);
+        insert_ssd_fd->is_open = 1;
+        insert_ssd_fd->ori_fd = aiocb_ptr_array[0]->aio_fildes;
+        insert_ssd_fd->write_back_fd= write_back_fd;
+	strcpy(insert_ssd_fd->cache,cache);
+        insert_ssd_fd->next = NULL;
+        end_ssd_fd->next = insert_ssd_fd;
+        (*ssd_fd)->fd = insert_ssd_fd->fd;
+        (*ssd_fd)->ori_fd = insert_ssd_fd->ori_fd;
+        (*ssd_fd)->is_open = insert_ssd_fd->is_open;
+        (*ssd_fd)->write_back_fd= write_back_fd;
+	strcpy((*ssd_fd)->cache,cache);
+        (*ssd_fd)->next = NULL;
+        
+    }
 	if(stat(filename,&statbuf)!=-1) *file_size = (TROVE_size)statbuf.st_size;
     return (((*ssd_fd)->fd < 0) ? -trove_errno_to_trove_error(errno) : 0);
 }
@@ -277,11 +353,12 @@ static void write_ssd(int fd,
                     )
 {
     int j=0,ret=0;
+    gettimeofday(&write_start,NULL);
     for(j=0;j<aiocb_inuse_count;j++)
     {
        size_p += aiocb_ptr_array[j]->aio_nbytes/1024;
 
-        if(j!=0){ret = open_fd_ssd(&ssd_fd,&file_size,DBPF_FD_DIRECT_WRITE,handle);}
+        //if(j!=0){ret = open_fd_ssd(&ssd_fd,&link_ssd_fd,&file_size,DBPF_FD_DIRECT_WRITE,handle,aiocb_ptr_array);}
         if(aiocb_ptr_array[j]->aio_nbytes==0)continue;
         int write_ret;
         Offset_pair_t d;
@@ -292,14 +369,18 @@ static void write_ssd(int fd,
         struct stat statbuf;
         FILE *avl;
         enum MAVLRES tmp;
-
         gen_mutex_lock(&dbpf_update_offset_map_lock);
+        gettimeofday(&avl_start,NULL);
+        file_size+=128;
         d = (Offset_pair_t)malloc(sizeof(struct Offset_pair));
         d->access_size = (TROVE_size)aiocb_ptr_array[j]->aio_nbytes;
         d->original_offset = (TROVE_offset)aiocb_ptr_array[j]->aio_offset;
-        d->new_offset = file_size;
+        d->new_offset = (TROVE_offset)aiocb_ptr_array[j]->aio_offset;
+	    strcmp(d->cache,ssd_fd->cache);
     	tmp = mavlinsert(&nodew,d);
-
+        gettimeofday(&avl_end,NULL);
+        avl_diff+=1000000*(avl_end.tv_sec-avl_start.tv_sec)+avl_end.tv_usec-avl_start.tv_usec;
+    ssdsizesum+=aiocb_ptr_array[j]->aio_nbytes;
     gen_mutex_unlock(&dbpf_update_offset_map_lock);
     write_ret = direct_aligned_write_ssd(
             fd, aiocb_ptr_array[j]->aio_buf, 0, aiocb_ptr_array[j]->aio_nbytes,aiocb_ptr_array[j]->aio_offset);
@@ -1356,32 +1437,44 @@ inline int dbpf_bstream_rw_list(TROVE_coll_id coll_id,
 
 	if(size_p>b_threshold)
 	{
-
-	    while(noderlock!=0);
-	    noder = nodew;
-	    noderlock = 1;
-	    nodew = NULL;
-	    close(ssd_fd->fd);
-	    free(ssd_fd);
-	    ssd_fd=NULL;		
-		size_p = 0;
-		for(j=0;j<aiocb_inuse_count;j++)
-		{
-			size_p += aiocb_ptr_array[j]->aio_nbytes/1024;
-		}
+	    while(noderlock!=0){
 		
-		if(block_num==1)
-		{
-			full_flag1 = true;
-			block_num = 2;
-            snprintf(to_buffer_region,PATH_MAX,my_wb_info.buff_path_2);
+		 in_dead_lock=1;// && is_hdd==0);// gossip_err("is in the deadlock!\n");
+		gossip_err("now dead lock is 1\n");
+		break;
 		}
-		else if(block_num==2)
-		{
-			full_flag2 = true;
-			block_num = 1;
-            snprintf(to_buffer_region,PATH_MAX,my_wb_info.buff_path_1);
-		}
+	    
+	    while(noderlock!=0);
+	    if(noderlock==0)
+	    {
+		in_dead_lock=0;
+	    	noder = nodew;
+	    	noderlock = 1;
+	    	nodew = NULL;
+
+	    size_p = 0;
+	    for(j=0;j<aiocb_inuse_count;j++)
+	    {
+		size_p += aiocb_ptr_array[j]->aio_nbytes/1024;
+	    }
+	    switch(block_num)
+            {
+                case 1:
+                    full_flag1 = true;
+                    block_num = 2;
+		    link_ssd_fd = link_ssd_fd_2;
+                    snprintf(to_buffer_region,PATH_MAX,my_wb_info.buff_path_2);
+                    gossip_err("ssd_1 is full! new buffer is %s\n",to_buffer_region);
+                    break;
+                case 2:
+                    full_flag2 = true;
+                    block_num = 1;
+		    link_ssd_fd = link_ssd_fd_1;
+                    snprintf(to_buffer_region,PATH_MAX,my_wb_info.buff_path_1);
+                    gossip_err("ssd_2 is full! new buffer is %s\n",to_buffer_region);
+                    break;
+            }
+	    }
 	}
 
 	pthread_attr_init(&attr);
@@ -1393,15 +1486,15 @@ inline int dbpf_bstream_rw_list(TROVE_coll_id coll_id,
 		pthread_attr_destroy(&attr);
 		
 	}
-	else gossip_err("w:write back exist!\n");
-
-    ret = open_fd_ssd(&ssd_fd,&file_size,DBPF_FD_DIRECT_WRITE,op_p->handle);
-    if (ret<0)
-    {
-        return ret;
-    }
-    
-
+        if(block_num==1)
+            ret = open_fd_ssd(&ssd_fd,&link_ssd_fd_1,&file_size,DBPF_FD_DIRECT_WRITE,op_p->handle, aiocb_ptr_array,q_op_p->op.u.b_rw_list.open_ref.fd);
+        else
+            ret = open_fd_ssd(&ssd_fd,&link_ssd_fd_2,&file_size,DBPF_FD_DIRECT_WRITE,op_p->handle, aiocb_ptr_array,q_op_p->op.u.b_rw_list.open_ref.fd);
+        if (ret<0)
+        {
+            return ret;
+        }
+    gettimeofday(&group_start,NULL);
     for(j=0;j<aiocb_inuse_count;j++)
     {
         offset_array[i_tt].offset = aiocb_ptr_array[j]->aio_offset;   
@@ -1440,24 +1533,75 @@ inline int dbpf_bstream_rw_list(TROVE_coll_id coll_id,
     	    }
     	}
     	percent = ((float)notzero)/(float)(rs_length-1);
-    	k_ori = 0;
+        percsum+=percent;
+    	per = percent;
+        if(fabs(per-level)>0.2)
+        {
+            clearcount+=1;
+            if(clearflag==0)
+                clearflag=1;
+        }
+        if(clearperlistcount>10)
+        {
+            if(clearcount/clearperlistcount>=0.8)
+            {
+                per_list_len=0;
+                percsum = per;
+            }
+            clearcount=0;
+            clearflag=0;
+            clearperlistcount=0;
+        }
+        if(clearflag)
+            clearperlistcount+=1;
+        percent_list[per_list_len++] = per;
+        int k;
+        for(j=0;j<per_list_len-1;j++)
+        {
+            if(per<=percent_list[j])
+            {
+                for(k=j;k<per_list_len;k++)
+                {
+                    temp_per = percent_list[k];
+                    percent_list[k] = per;
+                    per = temp_per;
+                }
+                break;
+            }
+        }
+        percavg=percsum/per_list_len;
+        level = percent_list[(int)((1-percavg)*per_list_len)];
+        k_ori = 0;
     	notzero = 0;
     	i_tt = 0;
+    	total_rate=(float)(total_is_ssd)/(total_is_ssd+total_is_hhd);
+    	rate=(float)(is_ssd)/(is_ssd+is_hhd);
+        
     }
-
-   
-    if(percent > high_w && is_write_hhd)
+    gettimeofday(&group_end,NULL);
+    group_diff+=1000000*(group_end.tv_sec-group_start.tv_sec)+group_end.tv_usec-group_start.tv_usec;
+    if(i_tt==0)
+        gossip_err("group cost = %ld, avl cost = %ld\n",group_diff,avl_diff);
+    mod_flag=my_wb_info.flag;
+    if(mod_flag)
+    {
+        high_w=level;
+        low_w=level;
+    }
+    if(percent>0.3 && percent > high_w && is_write_hhd)
     {
         is_write_hhd = 0;
     }
-    else if(percent < low_w && is_write_hhd==0)
+    else if((percent < low_w && is_write_hhd==0)||percent<0.3)
     {
 	   is_write_hhd = 1;
     }
-
+    
+    gettimeofday(&open_start,NULL);
     if(is_write_hhd)
     {
 	    is_hhd++;
+            total_is_hhd++;
         ret = issue_or_delay_io_operation(
             q_op_p, aiocb_ptr_array, aiocb_inuse_count,
             &op_p->u.b_rw_list.sigev, 0);
@@ -1467,20 +1611,10 @@ inline int dbpf_bstream_rw_list(TROVE_coll_id coll_id,
    	    write_ssd(ssd_fd->fd,op_p->handle,aiocb_ptr_array,aiocb_inuse_count,file_size);
 	    aio_progress_notification_ssd(q_op_p); 
 	    is_ssd++;
+            total_is_ssd++;
     }
-    
-    if(is_ssd+is_hhd == 4000)
-    {
-        is_ssd=0;
-        is_hhd=0;
-    }
-   
-/*
-    if (ret)
-    {
-        return ret;
-    }
-*/
+    if(rate>0.5)
+	    cr_mod = true;
 #endif
     return 0;
 }
@@ -1994,118 +2128,266 @@ struct TROVE_bstream_ops dbpf_bstream_ops =
 
 static int write_back(void *parm)
 {
-	struct stat statbuf;
-	off_t read_offset = 0;
-	TROVE_size  total_size=0,file_size=0;
-	int file_num = 0;
-	char buffer_region[100] = {0};
-	int ret;
-	char *wb_buf = NULL;
-	int i,fd_ssd;
-	TROVE_size buf_size=0;   
-	int fd = *((int *)parm);
-	Offset_pair_t offset_data;
-	char message[100] = {0};
-	int have_read = 0;
+    ssd_cache_fd * start_ssd_fd, *end_ssd_fd;
+    struct stat statbuf;
+    off_t read_offset = 0;
+    TROVE_size  total_size=0,file_size=0;
+    int file_num = 0;
+    char buffer_region[100] = {0};
+    int ret;
+    char *wb_buf = NULL;
+    int i;
+    write_back_use * write_back_fd, *temp, *start, *end;
+    TROVE_size buf_size=0;   
+    int fd = *((int *)parm);
+    Offset_pair_t offset_data;
+    char message[100] = {0};
+    int have_read = 0;
 
     char cache_name[40] = {0};
-	off_t offset=0;
-	char test_buf[20] = "this is a test!";
+    off_t offset=0;
+    char test_buf[20] = "this is a test!";
 
 	
-	if(is_writeback_exist)return 1;
+    if(is_writeback_exist)return 1;
 	
-	gen_mutex_lock(&dbpf_writeback_thread);
+    gen_mutex_lock(&dbpf_writeback_thread);
     is_writeback_exist = true;
     gen_mutex_unlock(&dbpf_writeback_thread);
 
-	if(full_flag1)
-	{
-		snprintf(buffer_region,100,my_wb_info.buff_path_1);
-        strcpy(cache_name,buffer_region);
-        strcat(cache_name,"/cache");
-        gossip_err("cache_name:%s",cache_name);
-        fd_ssd = open(cache_name,O_RDWR);
-        if(stat(cache_name,&statbuf)!=-1) file_size = (TROVE_size)statbuf.st_size;
-		flush_num = 1;
-	}
-	else if(full_flag2)
-	{
-        snprintf(buffer_region,100,my_wb_info.buff_path_2);
-        strcpy(cache_name,buffer_region);
-        strcat(cache_name,"/cache");
-        gossip_err("cache_name:%s",cache_name);
-        fd_ssd = open(cache_name,O_RDWR);
-        if(stat(cache_name,&statbuf)!=-1) file_size = (TROVE_size)statbuf.st_size;
-        flush_num = 2;
-
-	}
-	else 
-	{
-		gen_mutex_lock(&dbpf_writeback_thread);
-    	is_writeback_exist = false;
-    	gen_mutex_unlock(&dbpf_writeback_thread);
-		return 1;
-	}
-	
-	for(i=0;i<204800;i++){
-		avl_offset_array[i] = -1;
-		avl_size_array[i] = -1;
-	}	
-	avl_index = 0;
-	merge = 0;
-	if(noder==NULL)gossip_err("write back error\n");
-	in_order_travel_test(noder);
-     wb_buf = (char *)malloc(sizeof(char) * avl_size_array[0]);
-	 avl_index = 0;
-	while(avl_index<204800 && avl_offset_array[avl_index]!=-1 && avl_size_array[avl_index!=-1])
+    write_back_fd = (write_back_use*)malloc(sizeof(write_back_use));
+    write_back_fd->fd = -1;
+    write_back_fd->ssd_fd = -1;
+    write_back_fd->next = NULL;
+    temp = write_back_fd;
+    //pthread_mutex_lock(&noderlock_mutex);
+    if(full_flag1)
     {
-        ret = pread(fd_ssd,wb_buf, avl_size_array[avl_index],avl_offset_array[avl_index]);
-        ret = pwrite(fd,wb_buf, avl_size_array[avl_index],avl_offset_array[avl_index]);
-		free(wb_buf);
-		avl_index++;
-		wb_buf = (char *)malloc(sizeof(char) * avl_size_array[avl_index]);
-		total_size+=ret;
-		read_offset+=ret;
-	}
-
-	free(wb_buf);
-	if(noder==NULL)gossip_err("noder is NULL\n");
-	destroy_avl(&noder);
-	noder = NULL;
-	noderlock=0;
-	wb_total = 0;
-
-	avl_total_size=0;
-	
-	gen_mutex_lock(&dbpf_writeback_thread);
-	is_writeback_exist = false;
-	gen_mutex_unlock(&dbpf_writeback_thread);
-	free_block_total++;
-	if(flush_num==2)
-	{
-		full_flag2=false;
-		close(fd_ssd);
-        snprintf(buffer_region,100,my_wb_info.buff_path_2);
-        strcpy(cache_name,buffer_region);
-        strcat(cache_name,"/cache");
-        gossip_err(cache_name);
-        unlink(cache_name);
-	}
-	else if(flush_num==1)
-	{
-		full_flag1=false;
-		close(fd_ssd);
         snprintf(buffer_region,100,my_wb_info.buff_path_1);
         strcpy(cache_name,buffer_region);
-        strcat(cache_name,"/cache");
-        gossip_err(cache_name);
-        unlink(cache_name);
-	}
-	
-	if(noder==NULL)gossip_err("noder is null\n");
-	if(noderlock==0)gossip_err("noderlock is 0\n");
+        int wbi = 0;
+        for(start_ssd_fd=link_ssd_fd_1->next;start_ssd_fd!=NULL;start_ssd_fd=start_ssd_fd->next)
+        {
+            char cid[5], cache[20]="/cache-";
+            sprintf(cid,"%d",start_ssd_fd->ori_fd);
+            strcat(cache,cid);
+            strcat(cache_name,cache);
+            write_back_use * insert;
+            insert = (write_back_use*)malloc(sizeof(write_back_use));
+            insert->fd = start_ssd_fd->write_back_fd;
+            insert->ssd_fd = open(cache_name,O_RDWR);
+            temp->next = insert;
+            temp = insert;
+            memset(cache_name,0,sizeof(cache_name));
+            strcpy(cache_name,buffer_region);
+            if(stat(cache_name,&statbuf)!=-1) file_size = (TROVE_size)statbuf.st_size;
+        }
+	flush_num = 1;
+    }
+    else if(full_flag2)
+    {
+        snprintf(buffer_region,100,my_wb_info.buff_path_2);
+        strcpy(cache_name,buffer_region);
+        for(start_ssd_fd=link_ssd_fd_2->next;start_ssd_fd!=NULL;start_ssd_fd=start_ssd_fd->next)
+        {
+            char cid[5], cache[20]="/cache-";
+            sprintf(cid,"%d",start_ssd_fd->ori_fd);
+            strcat(cache,cid);
+            strcat(cache_name,cache);
+            write_back_use * insert;
+            insert = (write_back_use*)malloc(sizeof(write_back_use));
+            insert->fd = start_ssd_fd->write_back_fd;
+            insert->ssd_fd = open(cache_name,O_RDWR);
+            temp->next = insert;
+            temp = insert;
+            memset(cache_name,0,sizeof(cache_name));
+            strcpy(cache_name,buffer_region);
+            if(stat(cache_name,&statbuf)!=-1) file_size = (TROVE_size)statbuf.st_size;
+        }
+        flush_num = 2;
+
+    }
+    else 
+    {
+	gen_mutex_lock(&dbpf_writeback_thread);
+    	is_writeback_exist = false;
+    	gen_mutex_unlock(&dbpf_writeback_thread);
 	return 1;
+    }
+	
+    for(i=0;i<204800;i++){
+        avl_offset_array[i] = -1;
+        avl_offset_array_ssd[i] = -1;
+	avl_size_array[i] = -1;
+	}	
+    avl_index = 0;
+    merge = 0;
+    if(noder==NULL)gossip_err("write back error\n");
+    in_order_travel_test(noder);
+    wb_buf = (char *)malloc(sizeof(char) * avl_size_array[0]);
+    avl_index = 0;
+
+    float static ppp=0.0;
+    int static pll=0;
+    int endrun;
+    /*
+    while(per_list_len<500)
+    {
+	if(cr_mod)
+	    break;
+    	if(mod_flag==0)
+	        break;
+        if(ppp!=percent){
+            ppp=percent;
+            gossip_err("percent=%f\n",ppp);
+        }
+        if(pll!=per_list_len){
+            pll=per_list_len;
+            gossip_err("per_list_len=%d\n",pll);
+        }
+        if(in_dead_lock==1){
+            gossip_err("in dead lock so exit\n");
+            break;
+        }
+	    if(percent>0.9){
+	        gossip_err("percent>0.7 exit\n");
+            break;
+    	}
+        endrun=is_hdd+is_ssd;
+        //sleep(1);
+        if(endrun==is_hdd+is_ssd){
+            gossip_err("end run exit\n");
+            //break;
+	    }
+
+    }*/
+    is_ssd=0;
+    is_hhd=0;
+    rate=0.0;
+    gossip_err("start flushing!per_list_len=%d,percent=%f\n",per_list_len,percent);
+    while(avl_index<204800 && avl_offset_array[avl_index]!=-1 && avl_size_array[avl_index!=-1])
+    {
+        for(start=write_back_fd->next;start!=NULL;start=start->next)
+        {
+	    if(strcmp(start->cache, avl_cachename[avl_index])==0)
+		break;
+	}
+            ret = pread(start->ssd_fd,wb_buf, avl_size_array[avl_index],avl_offset_array_ssd[avl_index]);
+            ret = pwrite(start->fd,wb_buf, avl_size_array[avl_index],avl_offset_array[avl_index]);
+            free(wb_buf);
+            avl_index++;
+            wb_buf = (char *)malloc(sizeof(char) * avl_size_array[avl_index]);
+            total_size+=ret;
+            read_offset+=ret;
+        
+    }
+    
+    free(wb_buf);
+    if(noder==NULL)gossip_err("noder is NULL\n");
+    destroy_avl(&noder);
+    noder = NULL;
+    //pthread_mutex_unlock(&noderlock_mutex);
+    wb_total = 0;
+
+    avl_total_size=0;
+
+    gen_mutex_lock(&dbpf_writeback_thread);
+    is_writeback_exist = false;
+    gen_mutex_unlock(&dbpf_writeback_thread);
+    is_hdd=0;
+    free_block_total++;
+    if(flush_num==2)
+    {
+        full_flag2=false;
+        snprintf(buffer_region,100,my_wb_info.buff_path_2);
+        strcpy(cache_name,buffer_region);
+        for(start_ssd_fd=link_ssd_fd_2;start_ssd_fd!=NULL;start_ssd_fd=start_ssd_fd->next)
+        {
+            char cid[5], cache[20]="/cache-";
+            if(start_ssd_fd->fd == -1)
+                continue;
+            sprintf(cid,"%d",start_ssd_fd->ori_fd);
+            strcat(cache,cid);
+            strcat(cache_name,cache);
+            unlink(cache_name);
+            memset(cache_name,0,sizeof(cache_name));
+            strcpy(cache_name,buffer_region);
+        }
+        if(noder==NULL)gossip_err("noder is null\n");
+        if(noderlock==0)gossip_err("noderlock is 0\n");
+        write_back_use * wdel;
+        while(write_back_fd)
+        {    
+             wdel=write_back_fd->next;
+             if(wdel==NULL)
+                break;
+             close(wdel->ssd_fd);
+             free(wdel);
+             write_back_fd = wdel;
+        }    
+        ssd_cache_fd* del = link_ssd_fd_2->next;
+        ssd_cache_fd* tmp;
+        while(del)
+        {    
+            tmp=del->next;
+            if(tmp==NULL)
+                break;
+            close(del->fd);
+            free(del);
+            del = tmp; 
+                           
+        }
+        link_ssd_fd_2->next=NULL;
+
+
+   }
+    else if(flush_num==1)
+    {
+        full_flag1=false;
+        snprintf(buffer_region,100,my_wb_info.buff_path_1);
+        strcpy(cache_name,buffer_region);
+        for(start_ssd_fd=link_ssd_fd_1;start_ssd_fd!=NULL;start_ssd_fd=start_ssd_fd->next)
+        {
+            char cid[5], cache[20]="/cache-";
+            if(start_ssd_fd->fd == -1)
+                continue;
+            sprintf(cid,"%d",start_ssd_fd->ori_fd);
+            strcat(cache,cid);
+            strcat(cache_name,cache);
+            unlink(cache_name);
+            memset(cache_name, 0, sizeof(cache_name));
+            strcpy(cache_name,buffer_region);
+        }
+
+        if(noder==NULL)gossip_err("noder is null\n");
+        if(noderlock==0)gossip_err("noderlock is 0\n");
+        
+        write_back_use * wdel;
+        while(write_back_fd)
+        {
+	    wdel=write_back_fd->next;
+            if(wdel==NULL)
+                break;
+            close(wdel->ssd_fd);
+            free(wdel);
+            write_back_fd = wdel;
+        }
+        ssd_cache_fd* del = link_ssd_fd_1->next;
+        ssd_cache_fd* tmp;
+        while(del)
+        {
+	       tmp=del->next;
+           if(tmp==NULL)
+                break;
+           close(del->fd);
+           free(del);
+           del = tmp;
+        }
+       link_ssd_fd_1->next=NULL;
+    }
+    	
+    noderlock=0;
+    return 1;
 }
 
 static void in_order_travel_test(struct mavlnode *n)
@@ -2119,7 +2401,9 @@ static void in_order_travel_test(struct mavlnode *n)
 		}
 		else{
 			avl_offset_array[avl_index] = n->d->original_offset;
+			avl_offset_array_ssd[avl_index] = n->d->new_offset;
 			avl_size_array[avl_index] = n->d->access_size;
+			strcpy(avl_cachename[avl_index],n->d->cache);
 			avl_index++;
 		}
 		in_order_travel_test(n->right);		

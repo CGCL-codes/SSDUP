@@ -1,3 +1,4 @@
+<<<<<<< HEAD
 # Start
 
 ```bash
@@ -19,6 +20,7 @@ low_watermark : 0.3
 
 rs_length : 128
 
+flag : 1
 ```
 
 # Compile
@@ -41,3 +43,6 @@ Other operations remain the same as orangefs
 
 If you want to know more about SSDUP, please refer to the ICS paper:
 Xuanhua Shi, Ming Li, Wei Liu, Hai Jin, Chen Yu, and Yong Chen, "SSDUP: A Traffic-Aware SSD Burst Buffer for HPC Systems". in Proceedings of the ACM International Conference on Supercomputing (ICS), Chicago, Illinois, USA, June 13-16, 2017.
+=======
+# tpds
+>>>>>>> addcac932991f50193c3f9db966659c0a30a9722

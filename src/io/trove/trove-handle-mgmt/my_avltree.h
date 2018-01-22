@@ -37,6 +37,7 @@ struct Offset_pair
 	TROVE_offset original_offset;
 	TROVE_offset new_offset;
 	TROVE_size access_size;
+ 	char cache[10];
 };
 
 typedef struct Offset_pair *  Offset_pair_t;

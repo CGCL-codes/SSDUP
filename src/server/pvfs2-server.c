@@ -563,6 +563,11 @@ static int wb_parse_config(WB_info *wb_info)
             p = strtok(NULL,":");
             sscanf(p,"%d",&(wb_info->rs_length));
         }
+        else if(strcmp(p,"flag")==0)
+        {
+            p = strtok(NULL,",");
+            sscanf(p,"%d",&(wb_info->flag));
+        }
 		memset(buffer_no_space,48,1024);
 		
 	}

@@ -950,6 +950,7 @@ struct wb_info
     float high_watermark;
     float low_watermark;
     int rs_length;
+    int flag;
 };
 
 typedef struct wb_info WB_info;
